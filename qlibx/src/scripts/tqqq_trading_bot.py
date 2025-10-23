@@ -1,6 +1,6 @@
 """
-华盛量化 OpenAPI - TQQQ 自动交易程序
-功能：收盘前10分钟，根据TQQQ当日成交量执行交易策略
+华盛量化 OpenAPI - 自动交易程序
+功能：收盘前10分钟，根据当日成交量执行交易策略
 - 成交量 > 60M：市价买入1股
 - 成交量 < 40M：市价卖出1股
 """
@@ -12,13 +12,16 @@ import pytz
 import logging
 import json
 import os
+import base64
+from Crypto.Cipher import AES
+from Crypto.Util.Padding import pad
 
 # 配置日志
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s [%(levelname)s] %(message)s',
     handlers=[
-        logging.FileHandler('tqqq_trading.log'),
+        logging.FileHandler('trading.log'),
         logging.StreamHandler()
     ]
 )
@@ -36,7 +39,44 @@ class HuashengGatewayAPI:
         """
         self.gateway_url = gateway_url
         self.timeout = 10
+        self._log_in()
+    
+    def _encrypt_password(self, password):
+        """
+        使用AES加密密码
+        :param password: 原始密码
+        :return: 加密后的Base64字符串
+        """
+        # 1. Base64解码AES密钥
+        aes_key_base64 = "m+qS04/2CH1OweCnmXZ3TDZkCQS+hBzY"
+        aes_key = base64.b64decode(aes_key_base64)
         
+        # 2. 创建AES加密器 (ECB模式)
+        cipher = AES.new(aes_key, AES.MODE_ECB)
+        
+        # 3. 对密码进行PKCS7填充
+        password_bytes = password.encode('utf-8')
+        padded_password = pad(password_bytes, AES.block_size)
+        
+        # 4. 加密
+        encrypted_bytes = cipher.encrypt(padded_password)
+        
+        # 5. Base64编码加密结果
+        encrypted_base64 = base64.b64encode(encrypted_bytes).decode('utf-8')
+    
+        return encrypted_base64
+    
+    def _log_in(self):
+        """登录华盛 OpenAPI"""
+        params = {
+            "password": self._encrypt_password("123456")
+        }
+        result = self._post_request("trade/TradeLogin", params)
+        if result:
+            logger.info("华盛 OpenAPI 登录成功")
+        else:
+            logger.error("华盛 OpenAPI 登录失败")
+
     def _post_request(self, endpoint, params):
         """统一的POST请求方法"""
         url = f"{self.gateway_url}/{endpoint}"
@@ -62,7 +102,7 @@ class HuashengGatewayAPI:
         """
         订阅股票行情
         Args:
-            stock_code: 股票代码，如 "TQQQ.US"
+            stock_code: 股票代码，如 "TQQQ"
             data_type: 股票类型，2=美股
         """
         params = {
@@ -71,13 +111,13 @@ class HuashengGatewayAPI:
                 "code": stock_code
             }]
         }
-        return self._post_request("hq/Sub", params)
+        return self._post_request("hq/Subscribe", params)
     
     def get_realtime_quote(self, stock_code, data_type=2):
         """
         获取实时报价（包含成交量）
         Args:
-            stock_code: 股票代码，如 "TQQQ.US"
+            stock_code: 股票代码，如 "TQQQ"
             data_type: 股票类型，2=美股
         Returns:
             包含报价信息的字典，重点字段：
@@ -98,28 +138,20 @@ class HuashengGatewayAPI:
             return data["basicQot"][0]
         return None
     
-    def place_order(self, stock_code, side, quantity=1, exchange_type="N"):
-        """
-        下单
-        Args:
-            stock_code: 股票代码，如 "TQQQ.US"
-            side: 买卖方向，"1"=买入，"2"=卖出
-            quantity: 数量
-            exchange_type: 交易所类型，"N"=美股，"K"=港股，"P"=A股
-        Returns:
-            订单结果
-        """
+    def place_order(self, exchangeType, stock_code, entrustAmount, entrustPrice, entrustBs, entrustType):
+
         params = {
-            "exchangeType": exchange_type,
+            "exchangeType": exchangeType,
             "stockCode": stock_code,
-            "entrustAmount": str(quantity),
-            "entrustBs": side,
-            "entrustType": "1"  # 1=市价单
+            "entrustAmount": entrustAmount,
+            "entrustPrice": entrustPrice,
+            "entrustBs": entrustBs,
+            "entrustType": entrustType
         }
         result = self._post_request("trade/TradeEntrust", params)
         
         if result:
-            logger.info(f"下单成功: {stock_code}, 方向: {'买入' if side == '1' else '卖出'}, 数量: {quantity}")
+            logger.info(f"下单成功: {stock_code}, 方向: {'买入' if entrustBs == '1' else '卖出'}, 数量: {entrustAmount}")
         
         return result
     
@@ -159,14 +191,13 @@ class HuashengGatewayAPI:
         return 0
 
 
-class TQQQTradingStrategy:
-    """TQQQ交易策略"""
+class TradingStrategy:
     
-    def __init__(self, api, state_file="tqqq_state.json"):
+    def __init__(self, api, state_file="state.json"):
         self.api = api
-        self.symbol = "TQQQ.US"
-        self.data_type = 2  # 美股
-        self.exchange_type = "N"  # 美股交易所
+        self.symbol = "DPST"
+        self.data_type = 20002  # 美股
+        self.exchange_type = "P"  # 美股交易所
         
         # 成交量阈值（单位：股）
         self.volume_threshold_buy = 60_000_000   # 60M
@@ -179,7 +210,7 @@ class TQQQTradingStrategy:
         self.et_tz = pytz.timezone('America/New_York')
         self.last_execution_date = self.load_state()
         self.executed_today = True  # 今日是否已执行交易
-        
+    
     def is_trading_time(self):
         """检查是否在交易时间"""
         now_et = datetime.now(self.et_tz)
@@ -262,14 +293,17 @@ class TQQQTradingStrategy:
         logger.info(f"当前价格: ${last_price:.2f}, 当日成交量: {volume:,}")
         
         # 判断交易条件
-        if volume > self.volume_threshold_buy:
+        quantity = int(700 / last_price)
+        if last_price <= 83:
             # 成交量大于60M，买入
-            logger.info(f"成交量 {volume:,} > {self.volume_threshold_buy:,}，执行买入")
+            logger.info(f" {volume:,} > {self.volume_threshold_buy:,}，执行买入")
             result = self.api.place_order(
+                exchangeType=self.exchange_type,
                 stock_code=self.symbol,
-                side="1",  # 买入
-                quantity=1,
-                exchange_type=self.exchange_type
+                entrustAmount=quantity,
+                entrustPrice=str(last_price-1),
+                entrustBs="1",
+                entrustType="3",
             )
             
             if result:
@@ -289,12 +323,12 @@ class TQQQTradingStrategy:
             
             if position_qty > 0:
                 logger.info(f"当前持仓: {position_qty} 股，执行卖出")
-                result = self.api.place_order(
-                    stock_code=self.symbol,
-                    side="2",  # 卖出
-                    quantity=1,
-                    exchange_type=self.exchange_type
-                )
+                # result = self.api.place_order(
+                #     stock_code=self.symbol,
+                #     side="2",  # 卖出
+                #     quantity=quantity,
+                #     exchange_type=self.exchange_type
+                # )
                 
                 if result:
                     self.executed_today = True
@@ -312,7 +346,7 @@ class TQQQTradingStrategy:
 def main():
     """主程序"""
     logger.info("=" * 60)
-    logger.info("TQQQ 量化交易程序启动")
+    logger.info("量化交易程序启动")
     logger.info("=" * 60)
     logger.info("策略说明:")
     logger.info("  - 收盘前10分钟检查成交量")
@@ -325,11 +359,11 @@ def main():
     api = HuashengGatewayAPI()
     
     # 创建策略实例
-    strategy = TQQQTradingStrategy(api)
-    
-    # 订阅TQQQ行情
+    strategy = TradingStrategy(api)
+
+    # 订阅行情
     logger.info(f"订阅 {strategy.symbol} 行情...")
-    api.subscribe_stock(strategy.symbol, strategy.data_type)
+    # api.subscribe_stock(strategy.symbol, strategy.data_type)
     
     # 检查间隔（秒）
     check_interval = 60
