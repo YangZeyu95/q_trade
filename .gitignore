@@ -1,0 +1,8 @@
+# Ignore everything in this directory
+/*
+
+# Except for the src directory
+!qlibx/
+
+# And this .gitignore file itself
+!/.gitignore
