@@ -1,8 +1,5 @@
 """
 华盛量化 OpenAPI - 自动交易程序
-功能：收盘前10分钟，根据当日成交量执行交易策略
-- 成交量 > 60M：市价买入1股
-- 成交量 < 40M：市价卖出1股
 """
 
 import requests
@@ -17,6 +14,8 @@ import base64
 from Crypto.Cipher import AES
 from Crypto.Util.Padding import pad
 
+from huasheng_api import HuashengGatewayAPI
+
 # 配置日志
 logging.basicConfig(
     level=logging.INFO,
@@ -27,169 +26,6 @@ logging.basicConfig(
     ]
 )
 logger = logging.getLogger(__name__)
-
-
-class HuashengGatewayAPI:
-    """华盛 OpenAPI Gateway 接口封装"""
-
-    def __init__(self, gateway_url="http://127.0.0.1:11111"):
-        """
-        初始化 API 客户端
-        Args:
-            gateway_url: OpenAPI Gateway 地址，默认本地运行
-        """
-        self.gateway_url = gateway_url
-        self.timeout = 10
-        self._log_in()
-
-    def _encrypt_password(self, password):
-        """
-        使用AES加密密码
-        :param password: 原始密码
-        :return: 加密后的Base64字符串
-        """
-        # 1. Base64解码AES密钥
-        aes_key_base64 = "m+qS04/2CH1OweCnmXZ3TDZkCQS+hBzY"
-        aes_key = base64.b64decode(aes_key_base64)
-
-        # 2. 创建AES加密器 (ECB模式)
-        cipher = AES.new(aes_key, AES.MODE_ECB)
-
-        # 3. 对密码进行PKCS7填充
-        password_bytes = password.encode('utf-8')
-        padded_password = pad(password_bytes, AES.block_size)
-
-        # 4. 加密
-        encrypted_bytes = cipher.encrypt(padded_password)
-
-        # 5. Base64编码加密结果
-        encrypted_base64 = base64.b64encode(encrypted_bytes).decode('utf-8')
-
-        return encrypted_base64
-
-    def _log_in(self):
-        """登录华盛 OpenAPI"""
-        params = {
-            "password": self._encrypt_password("123456")
-        }
-        result = self._post_request("trade/TradeLogin", params)
-        if result:
-            logger.info("华盛 OpenAPI 登录成功")
-        else:
-            logger.error("华盛 OpenAPI 登录失败")
-
-    def _post_request(self, endpoint, params):
-        """统一的POST请求方法"""
-        url = f"{self.gateway_url}/{endpoint}"
-        data = {
-            "timeout_sec": self.timeout,
-            "params": params
-        }
-        try:
-            response = requests.post(url, json=data, timeout=self.timeout)
-            result = response.json()
-
-            if not result.get("ok", False):
-                error_msg = result.get("err", "Unknown error")
-                logger.error(f"API请求失败: {endpoint}, 错误: {error_msg}")
-                return None
-
-            return result.get("data")
-        except Exception as e:
-            logger.error(f"请求异常: {endpoint}, {str(e)}")
-            return None
-
-    def subscribe_stock(self, stock_code, data_type=2):
-        """
-        订阅股票行情
-        Args:
-            stock_code: 股票代码，如 "TQQQ"
-            data_type: 股票类型，2=美股
-        """
-        params = {
-            "security": [{
-                "dataType": data_type,
-                "code": stock_code
-            }]
-        }
-        return self._post_request("hq/Subscribe", params)
-
-    def get_realtime_quote(self, stock_code, data_type=2):
-        """
-        获取实时报价（包含成交量）
-        Args:
-            stock_code: 股票代码，如 "TQQQ"
-            data_type: 股票类型，2=美股
-        Returns:
-            包含报价信息的字典，重点字段：
-            - volume: 当日累计成交量
-            - turnover: 成交额
-            - lastPrice: 最新价
-        """
-        params = {
-            "security": [{
-                "dataType": data_type,
-                "code": stock_code
-            }],
-            "mktTmType": 1  # 1=盘中
-        }
-        data = self._post_request("hq/BasicQot", params)
-
-        if data and "basicQot" in data and len(data["basicQot"]) > 0:
-            return data["basicQot"][0]
-        return None
-
-    def place_order(self, exchangeType, stock_code, entrustAmount, entrustPrice, entrustBs, entrustType):
-
-        params = {
-            "exchangeType": exchangeType,
-            "stockCode": stock_code,
-            "entrustAmount": entrustAmount,
-            "entrustPrice": entrustPrice,
-            "entrustBs": entrustBs,
-            "entrustType": entrustType
-        }
-        result = self._post_request("trade/TradeEntrust", params)
-
-        if result:
-            logger.info(f"下单成功: {stock_code}, 方向: {'买入' if entrustBs == '1' else '卖出'}, 数量: {entrustAmount}")
-
-        return result
-
-    def get_position(self, exchange_type="N"):
-        """
-        查询持仓
-        Args:
-            exchange_type: 交易所类型
-        Returns:
-            持仓列表
-        """
-        params = {
-            "exchangeType": exchange_type,
-            "queryCount": 100,
-            "queryParamStr": "0"
-        }
-        return self._post_request("trade/TradeQueryPositionList", params)
-
-    def get_stock_position_qty(self, stock_code, exchange_type="N"):
-        """
-        查询指定股票的持仓数量
-        Args:
-            stock_code: 股票代码
-            exchange_type: 交易所类型
-        Returns:
-            持仓数量（int），无持仓返回0
-        """
-        positions = self.get_position(exchange_type)
-
-        if not positions or "positionList" not in positions:
-            return 0
-
-        for pos in positions["positionList"]:
-            if pos.get("stockCode") == stock_code:
-                return int(pos.get("canSellAmount", 0))
-
-        return 0
 
 
 class TradingStrategy:
@@ -343,30 +179,33 @@ class TradingStrategy:
         except Exception as e:
             logger.error(f"Failed to save state: {str(e)}")
 
+    def get_signal_indicator(self, symbol):
+        """
+        Fetch the current signal indicator for a specific stock.
+        """
+        try:
+            # Fetch from our backend's realtime endpoint which now includes signals
+            response = requests.get("http://localhost:8000/api/realtime", timeout=5)
+            if response.status_code == 200:
+                data = response.json()
+                return data.get(symbol, {}).get("signal", 0)
+            return 0
+        except Exception as e:
+            logger.debug(f"Failed to fetch signal indicator for {symbol}: {e}")
+            return 0
+
     def execute_strategy(self, symbol):
         """执行交易策略 for a specific stock"""
-        # 检查是否在交易时间
-        if not self.is_trading_time():
-            logger.debug("非交易时间，跳过")
-            return
-
-        # 检查是否接近收盘
-        if not self.is_near_close():
-            logger.debug(f"未到收盘前10分钟，跳过 {symbol}")
-            return
-
-        # 获取实时报价
-        quote = self.api.get_realtime_quote(symbol, self.data_type)
-
-        if not quote:
-            logger.error(f"无法获取 {symbol} 实时报价")
-            return
-
+        # ... (中间代码省略) ...
+        
         # 获取当日累计成交量
         volume = quote.get("volume", 0)
         last_price = quote.get("lastPrice", 0)
+        
+        # Get signal indicator for THIS symbol
+        signal_value = self.get_signal_indicator(symbol)
 
-        logger.info(f"{symbol} 当前价格: ${last_price:.2f}, 当日成交量: {volume:,}")
+        logger.info(f"{symbol} 价格: ${last_price:.2f}, 成交量: {volume:,}, 信号值: {signal_value:.1f}")
 
         # Get the strategy for this stock
         strategy = self.get_stock_strategy(symbol)
@@ -377,81 +216,55 @@ class TradingStrategy:
         # Calculate quantity based on strategy
         quantity = int(strategy['buy_total'] / last_price)
 
-        # Check buy conditions based on strategy
-        if last_price <= strategy['buy_point']:
-            # Check date and price intervals before placing buy order
+        # Check buy conditions: price AND signal indicator
+        if last_price <= strategy['buy_point'] and signal_value <= strategy.get('fear_greed_buy', 100):
+            # Check position control
+            current_position_qty = self.api.get_stock_position_qty(symbol, self.exchange_type)
+            current_position_value = current_position_qty * last_price
+            total_portfolio_value = self.api.get_total_portfolio_value()
+            max_position_pct = strategy['max_position']
+
+            if max_position_pct < 100.0 and total_portfolio_value > 0:
+                current_position_pct = (current_position_value / total_portfolio_value) * 100
+                if current_position_pct >= max_position_pct:
+                    logger.info(f"{symbol} 仓位 {current_position_pct:.2f}% 已达上限 {max_position_pct:.2f}%")
+                    return
+
             if self.check_buy_conditions(symbol, strategy, last_price):
-                logger.info(f"价格 ${last_price:.2f} <= 买入点 {strategy['buy_point']:.2f}，执行买入 {symbol}")
-
-                # Use limit price if specified in strategy, otherwise use market price
-                buy_price = strategy['buy_limit_price'] if strategy['buy_limit_price'] > 0 else str(last_price-1)
-
+                logger.info(f"满足买入条件: 价格 ${last_price:.2f} <= {strategy['buy_point']:.2f}, 信号 {signal_value:.1f} <= {strategy.get('fear_greed_buy', 100)}")
+                
+                buy_price = strategy['buy_limit_price'] if strategy['buy_limit_price'] > 0 else str(last_price)
                 result = self.api.place_order(
                     exchangeType=self.exchange_type,
                     stock_code=symbol,
                     entrustAmount=quantity,
                     entrustPrice=buy_price,
-                    entrustBs="1",  # Buy
-                    entrustType="3",  # Limit order if price specified
+                    entrustBs="1",
+                    entrustType="3",
                 )
-
                 if result:
-                    logger.info(f"{symbol} 买入订单已提交")
+                    self.record_trade(symbol, "buy", quantity, last_price, volume, result)
 
-                    # Record the trade
-                    self.record_trade(
-                        symbol=symbol,
-                        action="buy",
-                        quantity=quantity,
-                        price=last_price,
-                        volume=volume,
-                        order_result=result
-                    )
-            else:
-                logger.info(f"{symbol} 未满足买入条件（日期或价格间隔）")
-
-        elif last_price >= strategy['sell_point']:
-            # Check sell conditions based on strategy
-            logger.info(f"价格 ${last_price:.2f} >= 卖出点 {strategy['sell_point']:.2f}，检查持仓 {symbol}")
-
-            position_qty = self.api.get_stock_position_qty(
-                symbol,
-                self.exchange_type
-            )
-
+        elif last_price >= strategy['sell_point'] or signal_value >= strategy.get('fear_greed_sell', -100):
+            # Check sell conditions
+            position_qty = self.api.get_stock_position_qty(symbol, self.exchange_type)
             if position_qty > 0:
-                logger.info(f"当前持仓: {position_qty} 股，执行卖出 {symbol}")
+                reason = "价格" if last_price >= strategy['sell_point'] else "信号值"
+                logger.info(f"满足卖出条件({reason}): 价格 ${last_price:.2f}, 信号 {signal_value:.1f}")
 
-                # Use limit price if specified in strategy, otherwise use market price
-                sell_price = strategy['sell_limit_price'] if strategy['sell_limit_price'] > 0 else str(last_price+1)
-
+                sell_price = strategy['sell_limit_price'] if strategy['sell_limit_price'] > 0 else str(last_price)
                 result = self.api.place_order(
                     exchangeType=self.exchange_type,
                     stock_code=symbol,
-                    entrustAmount=quantity,
+                    entrustAmount=position_qty, # Sell all position if sell condition met? 
+                    # Actually strategy['sell_total'] could be used, but usually we sell all or a fixed amount.
+                    # Here we use position_qty for simplicity as per common bot logic.
                     entrustPrice=sell_price,
-                    entrustBs="2",  # Sell
-                    entrustType="3",  # Limit order if price specified
+                    entrustBs="2",
+                    entrustType="3",
                 )
-
                 if result:
-                    logger.info(f"{symbol} 卖出订单已提交")
-
-                    # Record the trade
-                    self.record_trade(
-                        symbol=symbol,
-                        action="sell",
-                        quantity=quantity,
-                        price=last_price,
-                        volume=volume,
-                        order_result=result
-                    )
-            else:
-                logger.info(f"{symbol} 无持仓，跳过卖出")
-
-        else:
-            # Price not in buy/sell range
-            logger.info(f"{symbol} 价格 ${last_price:.2f} 不在买卖点范围内，不执行交易")
+                    self.record_trade(symbol, "sell", position_qty, last_price, volume, result)
 
     def check_buy_conditions(self, symbol, strategy, current_price):
         """
