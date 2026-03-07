@@ -6,3 +6,6 @@
 
 # And this .gitignore file itself
 !/.gitignore
+
+.gemini/
+gha-creds-*.json
