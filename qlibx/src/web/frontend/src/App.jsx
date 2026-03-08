@@ -10,6 +10,7 @@ function App() {
   const [realtimeData, setRealtimeData] = useState({});
   const [holdings, setHoldings] = useState([]);
   const [indicator, setIndicator] = useState({ value: 0, name: 'Signal Indicator' });
+  const [account, setAccount] = useState({ total_asset: 0, market_value: 0, cash: 0, buying_power: 0, total_pnl: 0 });
   const [isModalOpen, setIsModalOpen] = useState(false);
   const [editingSymbol, setEditingSymbol] = useState(null);
   const [viewMode, setViewMode] = useState('grid'); // 'grid' or 'table'
@@ -20,15 +21,17 @@ function App() {
     buy_point: 0,
     sell_point: 0,
     buy_total: 700,
-    sell_total: 0,
+    sell_total: 700,
     buy_limit_price: 0,
     sell_limit_price: 0,
-    buy_day_interval: 1,
-    sell_day_interval: 1,
-    buy_price_interval: 2,
-    max_position: 100,
-    fear_greed_buy: -50,
-    fear_greed_sell: 50
+    buy_day_interval: 10,
+    sell_day_interval: 10,
+    buy_price_interval: 10,
+    max_position: 10,
+    fear_greed_buy: -60,
+    fear_greed_sell: 60,
+    lever: '3',
+    emo_area: 'us'
   });
 
   const fetchRealtime = React.useCallback(async () => {
@@ -39,6 +42,8 @@ function App() {
       setIndicator(indRes.data);
       const holdRes = await axios.get(`${API_BASE}/holdings`);
       setHoldings(holdRes.data);
+      const accRes = await axios.get(`${API_BASE}/account`);
+      setAccount(accRes.data);
     } catch (err) {
       console.error('Failed to fetch realtime data', err);
     }
@@ -57,7 +62,6 @@ function App() {
   }, [fetchRealtime]);
 
   useEffect(() => {
-    // eslint-disable-next-line react-hooks/set-state-in-effect
     fetchData();
     const interval = setInterval(() => {
       fetchRealtime();
@@ -73,7 +77,11 @@ function App() {
       setLoadingName(true);
       try {
         const res = await axios.get(`${API_BASE}/stock_info/${symbol}`);
-        setFormData(prev => ({ ...prev, name: res.data.name }));
+        if (res.data.name && res.data.name !== symbol) {
+          setFormData(prev => ({ ...prev, name: res.data.name }));
+        } else if (!formData.name) {
+          setFormData(prev => ({ ...prev, name: symbol }));
+        }
       } catch (err) {
         console.error('Failed to fetch stock name', err);
       } finally {
@@ -90,15 +98,17 @@ function App() {
       buy_point: parseFloat(hold.lastPrice) || 0,
       sell_point: parseFloat(hold.lastPrice) * 1.1 || 0,
       buy_total: 700,
-      sell_total: 0,
+      sell_total: 700,
       buy_limit_price: 0,
       sell_limit_price: 0,
-      buy_day_interval: 1,
-      sell_day_interval: 1,
-      buy_price_interval: 2,
-      max_position: 100,
-      fear_greed_buy: -50,
-      fear_greed_sell: 50
+      buy_day_interval: 10,
+      sell_day_interval: 10,
+      buy_price_interval: 10,
+      max_position: 10,
+      fear_greed_buy: -60,
+      fear_greed_sell: 60,
+      lever: '3',
+      emo_area: 'us'
     });
     setEditingSymbol(null);
     setActiveTab('strategies');
@@ -108,7 +118,12 @@ function App() {
   const handleOpenModal = (symbol = null) => {
     if (symbol) {
       setEditingSymbol(symbol);
-      setFormData({ symbol, ...strategies[symbol] });
+      setFormData({ 
+        symbol, 
+        lever: '3', 
+        emo_area: 'us',
+        ...strategies[symbol] 
+      });
     } else {
       setEditingSymbol(null);
       setFormData({
@@ -117,22 +132,24 @@ function App() {
         buy_point: 0,
         sell_point: 0,
         buy_total: 700,
-        sell_total: 0,
+        sell_total: 700,
         buy_limit_price: 0,
         sell_limit_price: 0,
-        buy_day_interval: 1,
-        sell_day_interval: 1,
-        buy_price_interval: 2,
-        max_position: 100,
-        fear_greed_buy: -50,
-        fear_greed_sell: 50
+        buy_day_interval: 10,
+        sell_day_interval: 10,
+        buy_price_interval: 10,
+        max_position: 10,
+        fear_greed_buy: -60,
+        fear_greed_sell: 60,
+        lever: '3',
+        emo_area: 'us'
       });
     }
     setIsModalOpen(true);
   };
 
   const handleDelete = async (symbol) => {
-    if (window.confirm(`Are you sure you want to delete ${symbol}?`)) {
+    if (window.confirm(`Delete strategy for ${symbol}?`)) {
       try {
         await axios.delete(`${API_BASE}/strategies/${symbol}`);
         fetchData();
@@ -185,6 +202,38 @@ function App() {
           </button>
         </div>
       </header>
+
+      <section className="account-summary" style={{ 
+        display: 'grid', 
+        gridTemplateColumns: 'repeat(auto-fit, minmax(180px, 1fr))', 
+        gap: '1rem', 
+        marginBottom: '2rem' 
+      }}>
+        <div className="stat-card" style={{ background: 'rgba(59, 130, 246, 0.1)', border: '1px solid rgba(59, 130, 246, 0.2)', padding: '1.25rem', borderRadius: '1rem' }}>
+          <div style={{ color: 'var(--text-muted)', fontSize: '0.75rem', marginBottom: '0.25rem' }}>Net Assets</div>
+          <div style={{ fontSize: '1.5rem', fontWeight: 800 }}>${account.total_asset.toLocaleString(undefined, {minimumFractionDigits: 2})}</div>
+        </div>
+        <div className="stat-card" style={{ background: 'var(--card-bg)', padding: '1.25rem', borderRadius: '1rem', border: '1px solid var(--glass-border)' }}>
+          <div style={{ color: 'var(--text-muted)', fontSize: '0.75rem', marginBottom: '0.25rem' }}>Holdings Value</div>
+          <div style={{ fontSize: '1.5rem', fontWeight: 700 }}>${account.market_value.toLocaleString(undefined, {minimumFractionDigits: 2})}</div>
+        </div>
+        <div className="stat-card" style={{ background: 'var(--card-bg)', padding: '1.25rem', borderRadius: '1rem', border: '1px solid var(--glass-border)' }}>
+          <div style={{ color: 'var(--text-muted)', fontSize: '0.75rem', marginBottom: '0.25rem' }}>Total Floating P&L</div>
+          <div style={{ fontSize: '1.5rem', fontWeight: 800, color: account.total_pnl >= 0 ? 'var(--success)' : 'var(--danger)' }}>
+            {account.total_pnl >= 0 ? '+' : ''}${account.total_pnl.toLocaleString(undefined, {minimumFractionDigits: 2})}
+          </div>
+        </div>
+        <div className="stat-card" style={{ background: 'var(--card-bg)', padding: '1.25rem', borderRadius: '1rem', border: '1px solid var(--glass-border)' }}>
+          <div style={{ color: 'var(--text-muted)', fontSize: '0.75rem', marginBottom: '0.25rem' }}>Cash (USD)</div>
+          <div style={{ fontSize: '1.5rem', fontWeight: 700, color: account.cash >= 0 ? 'var(--success)' : 'var(--danger)' }}>
+            {account.cash < 0 ? '-' : ''}${Math.abs(account.cash).toLocaleString(undefined, {minimumFractionDigits: 2})}
+          </div>
+        </div>
+        <div className="stat-card" style={{ background: 'var(--card-bg)', padding: '1.25rem', borderRadius: '1rem', border: '1px solid var(--glass-border)' }}>
+          <div style={{ color: 'var(--text-muted)', fontSize: '0.75rem', marginBottom: '0.25rem' }}>Buying Power</div>
+          <div style={{ fontSize: '1.5rem', fontWeight: 700, color: 'var(--primary)' }}>${account.buying_power.toLocaleString(undefined, {minimumFractionDigits: 2})}</div>
+        </div>
+      </section>
 
       <div className="tabs" style={{ 
         display: 'flex', 
@@ -338,8 +387,8 @@ function App() {
                         </span>
                       </div>
                       <div className="stat-item">
-                        <span className="stat-label">Buy Total</span>
-                        <span className="stat-value">${strat.buy_total}</span>
+                        <span className="stat-label">Buy / Sell Total</span>
+                        <span className="stat-value">${strat.buy_total} / <span style={{ color: strat.sell_total > 0 ? 'inherit' : 'var(--text-muted)' }}>${strat.sell_total || 0}</span></span>
                       </div>
                       <div className="stat-item" style={{ marginTop: '1rem' }}>
                         <span className="stat-label">Intervals (B/S)</span>
@@ -350,8 +399,8 @@ function App() {
                         <span className="stat-value">{strat.max_position}%</span>
                       </div>
                       <div className="stat-item" style={{ marginTop: '1rem' }}>
-                        <span className="stat-label">Signal Thresholds (B/S)</span>
-                        <span className="stat-value">{strat.fear_greed_buy} / {strat.fear_greed_sell}</span>
+                        <span className="stat-label">Signal (B/S) | Area</span>
+                        <span className="stat-value">{strat.fear_greed_buy} / {strat.fear_greed_sell} | {strat.emo_area}</span>
                       </div>
                     </div>
                   </div>
@@ -368,7 +417,7 @@ function App() {
                       <th>Name</th>
                       <th>Price / Weight</th>
                       <th>B/S Pt</th>
-                      <th>Buy Tot</th>
+                      <th>B/S Tot</th>
                       <th>Intervals (B/S)</th>
                       <th>Max Pos</th>
                       <th>Signal (B/S)</th>
@@ -388,7 +437,7 @@ function App() {
                             <div style={{ fontSize: '0.75rem', color: 'var(--primary)' }}>{real.weight.toFixed(1)}%</div>
                           </td>
                           <td style={{ color: 'var(--success)' }}>${strat.buy_point} / <span style={{ color: 'var(--danger)' }}>${strat.sell_point}</span></td>
-                          <td>${strat.buy_total}</td>
+                          <td>${strat.buy_total} / <span style={{ color: strat.sell_total > 0 ? 'inherit' : 'var(--text-muted)' }}>${strat.sell_total || 0}</span></td>
                           <td style={{ fontSize: '0.8125rem' }}>{strat.buy_day_interval}d / {strat.sell_day_interval}d | {strat.buy_price_interval}%</td>
                           <td>{strat.max_position}%</td>
                           <td>{strat.fear_greed_buy} / {strat.fear_greed_sell}</td>
@@ -483,51 +532,79 @@ function App() {
         </section>
       )}
 
-      <section className="history-section animate-fade-in">
-        <h2 className="section-title"><History size={24} style={{ verticalAlign: 'middle', marginRight: '0.75rem' }} /> Recent Trade History</h2>
+      {/* Recent Trade History Section */}
+      <section className="history-section animate-fade-in" style={{ marginTop: '3rem', padding: '1rem' }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: '0.75rem', marginBottom: '1.5rem' }}>
+          <History size={24} className="text-primary" />
+          <h2 style={{ margin: 0 }}>Recent Trade History</h2>
+        </div>
         <div style={{ overflowX: 'auto' }}>
-          <table>
+          <table className="strategy-table">
             <thead>
               <tr>
-                <th>Time</th>
+                <th>Timestamp</th>
                 <th>Symbol</th>
                 <th>Action</th>
+                <th>Qty</th>
                 <th>Price</th>
-                <th>Quantity</th>
-                <th>Volume</th>
+                <th>Status</th>
+                <th>Total</th>
               </tr>
             </thead>
             <tbody>
-              {history.slice(0, 10).map((trade, i) => (
+              {history.length > 0 ? history.map((item, i) => (
                 <tr key={i}>
-                  <td style={{ fontSize: '0.8125rem', color: 'var(--text-muted)' }}>{new Date(trade.timestamp).toLocaleString()}</td>
-                  <td style={{ fontWeight: 600 }}>{trade.symbol}</td>
+                  <td style={{ color: 'var(--text-muted)', fontSize: '0.8125rem' }}>{new Date(item.timestamp).toLocaleString()}</td>
+                  <td style={{ fontWeight: 700 }}>{item.symbol}</td>
                   <td>
-                    <span className={trade.action === 'buy' ? 'badge-buy' : 'badge-sell'}>
-                      {trade.action}
+                    <span className={`badge ${item.action === 'buy' ? 'badge-success' : 'badge-danger'}`} style={{
+                      padding: '0.25rem 0.75rem',
+                      borderRadius: '1rem',
+                      fontSize: '0.75rem',
+                      fontWeight: 700,
+                      background: item.action === 'buy' ? 'rgba(34, 197, 94, 0.1)' : 'rgba(239, 68, 68, 0.1)',
+                      color: item.action === 'buy' ? 'var(--success)' : 'var(--danger)'
+                    }}>
+                      {item.action.toUpperCase()}
                     </span>
                   </td>
-                  <td style={{ fontWeight: 500 }}>${Number(trade.price).toFixed(2)}</td>
-                  <td>{trade.quantity}</td>
-                  <td style={{ color: 'var(--text-muted)', fontSize: '0.8125rem' }}>{(trade.volume / 1000000).toFixed(1)}M</td>
+                  <td>{item.quantity}</td>
+                  <td>${parseFloat(item.price).toFixed(2)}</td>
+                  <td>
+                    <span style={{ 
+                      fontSize: '0.75rem', 
+                      padding: '0.2rem 0.5rem', 
+                      borderRadius: '0.25rem',
+                      background: item.status === 'Filled' ? 'rgba(34, 197, 94, 0.15)' : 'rgba(255, 255, 255, 0.05)',
+                      color: item.status === 'Filled' ? 'var(--success)' : 'var(--text-muted)',
+                      border: `1px solid ${item.status === 'Filled' ? 'var(--success)' : 'var(--glass-border)'}`
+                    }}>
+                      {item.status || 'Unknown'}
+                    </span>
+                  </td>
+                  <td style={{ fontWeight: 600 }}>${(parseFloat(item.price) * parseInt(item.quantity)).toLocaleString(undefined, {minimumFractionDigits: 2})}</td>
                 </tr>
-              ))}
+              )) : (
+                <tr>
+                  <td colSpan="7" style={{ textAlign: 'center', padding: '2rem', color: 'var(--text-muted)' }}>No trade history found.</td>
+                </tr>
+              )}
             </tbody>
           </table>
         </div>
       </section>
 
+      {/* Strategy Modal */}
       {isModalOpen && (
         <div className="modal-overlay">
-          <div className="modal-content animate-fade-in" style={{ maxWidth: '600px' }}>
-            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '1.5rem' }}>
-              <h2>{editingSymbol ? `Edit ${editingSymbol}` : 'Add New Stock'}</h2>
-              <button onClick={() => setIsModalOpen(false)} style={{ background: 'none', border: 'none', color: 'var(--text-muted)', cursor: 'pointer' }}>
-                <X size={24} />
-              </button>
+          <div className="modal-content animate-slide-up" style={{ maxWidth: '800px' }}>
+            <div className="modal-header">
+              <h2>{editingSymbol ? `Edit Strategy: ${editingSymbol}` : 'Add New Stock Strategy'}</h2>
+              <button className="btn-icon" onClick={() => setIsModalOpen(false)}><X size={24} /></button>
             </div>
+            
             <form onSubmit={handleSubmit}>
-              <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '1rem' }}>
+              <div style={{ display: 'grid', gridTemplateColumns: '1fr 1.5fr', gap: '1rem' }}>
                 <div className="form-group">
                   <label>Stock Symbol</label>
                   <input
@@ -543,16 +620,16 @@ function App() {
                   <label>Name</label>
                   <input
                     value={loadingName ? 'Fetching name...' : formData.name}
-                    readOnly
-                    placeholder="Auto-fetched from API"
-                    style={{ background: 'rgba(255,255,255,0.05)', cursor: 'not-allowed' }}
+                    onChange={(e) => setFormData({ ...formData, name: e.target.value })}
+                    placeholder="Auto-fetched or manual input"
+                    style={{ background: loadingName ? 'rgba(255,255,255,0.05)' : 'var(--card-bg)' }}
                   />
                 </div>
               </div>
 
               <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '1rem' }}>
                 <div className="form-group">
-                  <label>Buy Point ($)</label>
+                  <label>Buy Point (Price)</label>
                   <input
                     type="number" step="0.01"
                     value={formData.buy_point}
@@ -561,7 +638,7 @@ function App() {
                   />
                 </div>
                 <div className="form-group">
-                  <label>Sell Point ($)</label>
+                  <label>Sell Point (Price)</label>
                   <input
                     type="number" step="0.01"
                     value={formData.sell_point}
@@ -582,7 +659,7 @@ function App() {
                   />
                 </div>
                 <div className="form-group">
-                  <label>Sell Total ($)</label>
+                  <label>Sell Total ($) (0=all)</label>
                   <input
                     type="number"
                     value={formData.sell_total}
@@ -644,7 +721,7 @@ function App() {
                 <div className="form-group">
                   <label>Max Pos (%)</label>
                   <input
-                    type="number"
+                    type="number" step="0.1"
                     value={formData.max_position}
                     onChange={(e) => setFormData({ ...formData, max_position: parseFloat(e.target.value) })}
                     required
@@ -670,6 +747,36 @@ function App() {
                     onChange={(e) => setFormData({ ...formData, fear_greed_sell: parseFloat(e.target.value) })}
                     required
                   />
+                </div>
+              </div>
+
+              {/* Added API Config for Fear/Greed */}
+              <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '1rem', marginTop: '1rem', padding: '1rem', background: 'rgba(255,255,255,0.03)', borderRadius: '0.75rem' }}>
+                <div className="form-group">
+                  <label>Lever (杠杆倍数)</label>
+                  <select 
+                    value={formData.lever} 
+                    onChange={(e) => setFormData({ ...formData, lever: e.target.value })}
+                    style={{ background: 'var(--card-bg)', color: 'white', padding: '0.5rem', borderRadius: '0.5rem', border: '1px solid var(--glass-border)', width: '100%' }}
+                  >
+                    <option value="1">1x (Normal)</option>
+                    <option value="2">2x (Bull/Bear)</option>
+                    <option value="3">3x (TQQQ/INDL)</option>
+                    <option value="4">4x</option>
+                  </select>
+                </div>
+                <div className="form-group">
+                  <label>Emo Area (资产类型)</label>
+                  <select 
+                    value={formData.emo_area} 
+                    onChange={(e) => setFormData({ ...formData, emo_area: e.target.value })}
+                    style={{ background: 'var(--card-bg)', color: 'white', padding: '0.5rem', borderRadius: '0.5rem', border: '1px solid var(--glass-border)', width: '100%' }}
+                  >
+                    <option value="us">US Tech (美概/纳指)</option>
+                    <option value="a">China (中概)</option>
+                    <option value="coin">Crypto (币股)</option>
+                    <option value="other">Other (INDL/Japan/Global)</option>
+                  </select>
                 </div>
               </div>
 
