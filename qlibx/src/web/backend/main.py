@@ -5,6 +5,8 @@ import json
 import os
 import csv
 import sys
+import time
+import threading
 from typing import Dict, List, Optional
 from datetime import datetime
 import getpass
@@ -35,9 +37,37 @@ app.add_middleware(
 )
 
 STRATEGY_FILE = os.path.join(SCRIPTS_DIR, "stock_strategy.json")
+TRADES_DIR = os.path.join(SCRIPTS_DIR, "trades")
+
+# Lock for strategy file read/write to prevent race conditions
+_strategy_lock = threading.Lock()
 
 # Initialize API
 api = HuashengGatewayAPI()
+
+# 贪恐指数缓存 (key: symbol, value: (timestamp, score))
+SZDT_CACHE = {}
+CACHE_TTL = 300  # 5 分钟缓存
+
+def get_cached_signal(symbol: str, lever: str = "3", emo_area: str = "us"):
+    """带缓存的贪恐指数获取（API 失败时回退到过期缓存）"""
+    now = time.time()
+    if symbol in SZDT_CACHE:
+        ts, score = SZDT_CACHE[symbol]
+        if now - ts < CACHE_TTL:
+            return score
+    
+    # 缓存失效，调用真实 API
+    score = api.fetch_fear_greed_index(symbol, lever, emo_area)
+    if score is not None:
+        SZDT_CACHE[symbol] = (now, score)
+        return score
+    
+    # API failed — fall back to stale cache if available
+    if symbol in SZDT_CACHE:
+        logger.warning(f"API returned None for {symbol}, using stale cached value")
+        return SZDT_CACHE[symbol][1]
+    return 0.0
 
 class StockStrategy(BaseModel):
     name: Optional[str] = ""
@@ -53,19 +83,23 @@ class StockStrategy(BaseModel):
     max_position: float
     fear_greed_buy: float
     fear_greed_sell: float
+    lever: str 
+    emo_area: str
 
 def load_strategies():
-    if os.path.exists(STRATEGY_FILE):
-        with open(STRATEGY_FILE, 'r', encoding='utf-8') as f:
-            try:
-                return json.load(f)
-            except Exception:
-                return {}
-    return {}
+    with _strategy_lock:
+        if os.path.exists(STRATEGY_FILE):
+            with open(STRATEGY_FILE, 'r', encoding='utf-8') as f:
+                try:
+                    return json.load(f)
+                except Exception:
+                    return {}
+        return {}
 
 def save_strategies(strategies):
-    with open(STRATEGY_FILE, 'w', encoding='utf-8') as f:
-        json.dump(strategies, f, indent=2, ensure_ascii=False)
+    with _strategy_lock:
+        with open(STRATEGY_FILE, 'w', encoding='utf-8') as f:
+            json.dump(strategies, f, indent=2, ensure_ascii=False)
 
 @app.get("/api/strategies")
 def get_strategies():
@@ -74,8 +108,12 @@ def get_strategies():
 @app.get("/api/stock_info/{symbol}")
 def get_stock_info(symbol: str):
     """根据代码获取股票名称"""
-    name = api.get_stock_name(symbol.upper())
-    return {"symbol": symbol.upper(), "name": name}
+    try:
+        name = api.get_stock_name(symbol.upper())
+        return {"symbol": symbol.upper(), "name": name}
+    except Exception as e:
+        logger.error(f"Error fetching stock info for {symbol}: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to fetch stock info: {e}")
 
 @app.post("/api/strategies/{symbol}")
 def update_strategy(symbol: str, strategy: StockStrategy):
@@ -84,26 +122,48 @@ def update_strategy(symbol: str, strategy: StockStrategy):
         if not symbol:
             raise HTTPException(status_code=400, detail="Symbol cannot be empty")
         
-        # 自动刷新股票名字
+        # 1. 立即刷新股票名字
         try:
             official_name = api.get_stock_name(symbol)
-            if official_name:
+            if official_name and official_name != symbol:
                 strategy.name = official_name
         except Exception as e:
             logger.warning(f"Failed to fetch name for {symbol}: {e}")
-            if not strategy.name:
-                strategy.name = symbol
 
-        # 数值基础校验
-        if strategy.buy_point < 0 or strategy.sell_point < 0:
-            raise HTTPException(status_code=400, detail="Buy/Sell points cannot be negative")
-
+        # 2. 保存策略
         strategies = load_strategies()
-        # 存储转换后的字典
         strategies[symbol] = strategy.model_dump()
         save_strategies(strategies)
-        logger.info(f"Strategy for {symbol} saved successfully")
-        return {"status": "success", "message": f"Strategy for {symbol} updated"}
+        
+        # 3. 立即拉取一次实时行情和信号 (强制从 API 拉取，同步更新缓存)
+        current_price = 0.0
+        try:
+            quote = api.get_realtime_quote(symbol)
+            if quote:
+                pa_val = quote.get("preAfterPrice")
+                lp_val = quote.get("lastPrice")
+                pre_after = float(pa_val) if pa_val else 0.0
+                last_p = float(lp_val) if lp_val else 0.0
+                current_price = pre_after if pre_after > 0 else last_p
+        except Exception: pass
+        
+        # 强制 API 拉取
+        score = api.fetch_fear_greed_index(symbol, strategy.lever, strategy.emo_area)
+        current_signal = score if score is not None else 0.0
+        
+        # 同步更新缓存
+        SZDT_CACHE[symbol] = (time.time(), current_signal)
+
+        logger.info(f"Strategy for {symbol} saved and force-refreshed. Price: {current_price}, Signal: {current_signal}")
+        
+        return {
+            "status": "success", 
+            "strategy": strategies[symbol],
+            "realtime": {
+                "lastPrice": current_price,
+                "signal": current_signal
+            }
+        }
     except Exception as e:
         logger.error(f"Error saving strategy {symbol}: {str(e)}")
         if isinstance(e, HTTPException): raise e
@@ -111,6 +171,7 @@ def update_strategy(symbol: str, strategy: StockStrategy):
 
 @app.delete("/api/strategies/{symbol}")
 def delete_strategy(symbol: str):
+    symbol = symbol.strip().upper()
     strategies = load_strategies()
     if symbol in strategies:
         del strategies[symbol]
@@ -124,35 +185,60 @@ def get_realtime_data():
     symbols = list(strategies.keys())
     realtime_data = {}
     
-    # 1. 直接获取持仓列表来计算总市值 (比调用 API 方法更可靠)
+    # 1. 核心优化：一次性获取所有持仓并脱敏存储
+    pos_map = {}
     total_portfolio_value = 0.0
     try:
         holdings_res = api.get_position(exchange_type="P")
         pos_list = holdings_res.get("positionList", []) if holdings_res else []
-        total_portfolio_value = sum(float(pos.get("marketValue", 0)) for pos in pos_list)
+        for pos in pos_list:
+            raw_code = pos.get("stockCode", "")
+            # 统一脱敏：YINN.US -> YINN
+            clean_code = raw_code.upper().replace(".US", "").replace("US.", "").replace(".HK", "").replace("HK.", "")
+            pos_map[clean_code] = pos
+            total_portfolio_value += float(pos.get("marketValue", 0))
     except Exception as e:
-        logger.error(f"Error calculating total portfolio value: {e}")
+        logger.error(f"Error pre-fetching holdings: {e}")
 
-    for symbol in symbols:
-        try:
-            quote = api.get_realtime_quote(symbol)
-            last_price = quote.get("lastPrice", 0) if quote else 0
-        except Exception:
-            last_price = 0
-            
-        try:
-            qty = api.get_stock_position_qty(symbol, exchange_type="P")
-        except Exception:
-            qty = 0
+    # 2. 遍历策略中的 Symbol
+    for raw_symbol in symbols:
+        # 同样对策略里的 Symbol 脱敏: US.YINN -> YINN
+        clean_symbol = raw_symbol.upper().replace("US.", "").replace(".US", "").replace("HK.", "").replace(".HK", "")
         
-        stock_value = qty * last_price
-        # 2. 计算权重
+        try:
+            quote = api.get_realtime_quote(clean_symbol)
+            if quote:
+                pa_val = quote.get("preAfterPrice")
+                lp_val = quote.get("lastPrice")
+                # 转换并确保不为0
+                pre_after = float(pa_val) if pa_val else 0.0
+                last_p = float(lp_val) if lp_val else 0.0
+                last_price = pre_after if pre_after > 0 else last_p
+            else:
+                last_price = 0.0
+        except Exception as e:
+            logger.error(f"Error getting price for {raw_symbol}: {e}")
+            last_price = 0.0
+            
+        qty = 0
+        stock_value = 0.0
+        # 使用脱敏后的 Symbol 匹配持仓
+        if clean_symbol in pos_map:
+            pos = pos_map[clean_symbol]
+            qty_str = pos.get("enableAmount") or pos.get("currentAmount") or "0"
+            qty = int(float(qty_str))
+            stock_value = float(pos.get("marketValue", 0))
+        
         weight = (stock_value / total_portfolio_value * 100) if total_portfolio_value > 0 else 0
         
-        import random
-        stock_signal = random.uniform(-100, 100)
+        # 获取真实贪恐信号
+        strat = strategies[raw_symbol]
+        lever = strat.get("lever", "1")
+        emo_area = strat.get("emo_area", "us")
+        stock_signal = get_cached_signal(clean_symbol, lever, emo_area)
         
-        realtime_data[symbol] = {
+        # 返回数据时以 raw_symbol 为 key (前端预期)
+        realtime_data[raw_symbol] = {
             "lastPrice": last_price,
             "quantity": qty,
             "value": stock_value,
@@ -167,15 +253,10 @@ def get_full_holdings():
     try:
         res = api.get_position(exchange_type="P")
         pos_list = res.get("positionList", []) if res else []
-        
-        # 计算总市值
         total_mkt_val = sum(float(pos.get("marketValue", 0)) for pos in pos_list)
-        
-        # 为每项增加占比
         for pos in pos_list:
             mkt_val = float(pos.get("marketValue", 0))
             pos["weight"] = (mkt_val / total_mkt_val * 100) if total_mkt_val > 0 else 0
-            
         return pos_list
     except Exception as e:
         logger.error(f"Error fetching full holdings: {e}")
@@ -183,12 +264,48 @@ def get_full_holdings():
 
 @app.get("/api/indicator")
 def get_indicator():
-    import random
-    return {"value": random.uniform(-100, 100), "name": "Fear & Greed Index"}
+    """获取第一个股票的贪恐得分 (严格按配置同步)"""
+    strategies = load_strategies()
+    if not strategies:
+        return {"value": 0, "name": "No Data"}
+    first_symbol = list(strategies.keys())[0]
+    strat = strategies[first_symbol]
+    score = get_cached_signal(first_symbol, strat.get("lever", "1"), strat.get("emo_area", "us"))
+    return {"value": score, "name": f"Fear & Greed ({first_symbol})"}
+
+@app.get("/api/account")
+def get_account_status():
+    """获取账户综合资产状态"""
+    try:
+        funds = api.get_account_funds(exchange_type="P")
+        if not funds:
+            cash, power, net_asset_from_api = 0.0, 0.0, 0.0
+        else:
+            cash = float(funds.get("enableBalance", 0)) 
+            power = float(funds.get("buyPower", 0))      
+            net_asset_from_api = float(funds.get("assetBalance", 0)) 
+
+        holdings_res = api.get_position(exchange_type="P")
+        pos_list = holdings_res.get("positionList", []) if holdings_res else []
+        mkt_val = sum(float(pos.get("marketValue", 0)) for pos in pos_list)
+        total_pnl = sum(float(pos.get("incomeBalance", 0)) for pos in pos_list)
+        
+        return {
+            "total_asset": net_asset_from_api,
+            "market_value": mkt_val,
+            "cash": cash,
+            "buying_power": power,
+            "total_pnl": total_pnl,
+            "currency": "USD"
+        }
+    except Exception as e:
+        logger.error(f"Error fetching account status: {e}")
+        return {"total_asset": 0, "market_value": 0, "cash": 0, "buying_power": 0, "total_pnl": 0, "error": str(e)}
 
 @app.get("/api/history/{symbol}")
 def get_history(symbol: str):
-    history_file = os.path.join(SCRIPTS_DIR, f"{symbol.lower()}_trading.csv")
+    symbol = symbol.strip()
+    history_file = os.path.join(TRADES_DIR, f"{symbol.lower()}_trading.csv")
     if not os.path.exists(history_file):
         return []
     history = []
@@ -204,12 +321,12 @@ def get_history(symbol: str):
 @app.get("/api/all_history")
 def get_all_history():
     all_history = []
-    if not os.path.exists(SCRIPTS_DIR):
+    if not os.path.exists(TRADES_DIR):
         return []
-    for filename in os.listdir(SCRIPTS_DIR):
+    for filename in os.listdir(TRADES_DIR):
         if filename.endswith("_trading.csv"):
             symbol = filename.replace("_trading.csv", "").upper()
-            filepath = os.path.join(SCRIPTS_DIR, filename)
+            filepath = os.path.join(TRADES_DIR, filename)
             try:
                 with open(filepath, 'r', encoding='utf-8') as f:
                     reader = csv.DictReader(f)
