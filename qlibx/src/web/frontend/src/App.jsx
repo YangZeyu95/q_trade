@@ -1,20 +1,122 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import axios from 'axios';
-import { Plus, Edit2, Trash2, History, TrendingUp, DollarSign, Activity, X, List, LayoutGrid } from 'lucide-react';
+import { Plus, Edit2, Trash2, History, TrendingUp, DollarSign, Activity, X, List, LayoutGrid, Play, Square, Save, LogIn, RefreshCw, ShieldCheck, ArrowUpDown, ArrowUp, ArrowDown } from 'lucide-react';
+import OptionsAnalyzer from './OptionsAnalyzer';
+import { DEFAULT_ACCOUNT, normalizeAccount } from './dashboardData.js';
 
 const API_BASE = 'http://localhost:8000/api';
+const DEFAULT_RISK_CONFIG = {
+  max_total_leverage: 2.0,
+  min_maintenance_margin_ratio: 0.30,
+  szdt_auth_key_configured: false,
+  szdt_auth_key_source: 'unset'
+};
+
+const formatMarketTime = (value) => value
+  ? new Date(value).toLocaleString('zh-CN', {
+      timeZone: 'America/New_York',
+      hour12: false
+    })
+  : '-';
+
+const normalizeSymbol = (symbol) => String(symbol || '')
+  .toUpperCase()
+  .replace(/^US\./, '')
+  .replace(/\.US$/, '')
+  .replace(/^HK\./, '')
+  .replace(/\.HK$/, '');
+
+const getRealtimeForHolding = (stockCode, realtimeData) => {
+  const target = normalizeSymbol(stockCode);
+  const match = Object.entries(realtimeData).find(([symbol]) => normalizeSymbol(symbol) === target);
+  return match ? match[1] : { signal: null, signal_available: false };
+};
+
+const toSortableNumber = (value) => {
+  const number = Number(value);
+  return Number.isFinite(number) ? number : null;
+};
+
+const getHoldingSortValue = (holding, key, realtimeData) => {
+  switch (key) {
+    case 'symbol':
+      return String(holding.stockCode || '');
+    case 'name':
+      return String(holding.stockName || '');
+    case 'quantity':
+      return toSortableNumber(holding.enableAmount || holding.canSellAmount || 0);
+    case 'costPrice':
+      return toSortableNumber(holding.costPrice);
+    case 'currentPrice':
+      return toSortableNumber(holding.lastPrice);
+    case 'marketValue':
+      return toSortableNumber(holding.marketValue);
+    case 'weight':
+      return toSortableNumber(holding.weight);
+    case 'pnl':
+      return toSortableNumber(holding.incomeBalance || 0);
+    case 'signal': {
+      const realtime = getRealtimeForHolding(holding.stockCode, realtimeData);
+      return realtime.signal_available ? toSortableNumber(realtime.signal) : null;
+    }
+    default:
+      return null;
+  }
+};
 
 function App() {
   const [strategies, setStrategies] = useState({});
   const [history, setHistory] = useState([]);
+  const [realtimeOrders, setRealtimeOrders] = useState({
+    orders: [],
+    active_count: 0,
+    updated_at: null
+  });
   const [realtimeData, setRealtimeData] = useState({});
   const [holdings, setHoldings] = useState([]);
-  const [indicator, setIndicator] = useState({ value: 0, name: 'Signal Indicator' });
-  const [account, setAccount] = useState({ total_asset: 0, market_value: 0, cash: 0, buying_power: 0, total_pnl: 0 });
+  const [holdingSort, setHoldingSort] = useState({ key: 'symbol', direction: 'asc' });
+  const [indicator, setIndicator] = useState({ value: 0, available: false, name: 'Signal Indicator' });
+  const [account, setAccount] = useState(() => ({ ...DEFAULT_ACCOUNT }));
+  const [runtimeStatus, setRuntimeStatus] = useState({
+    state: 'stopped',
+    mode: null,
+    pid: null,
+    gateway_logged_in: false,
+    config: DEFAULT_RISK_CONFIG
+  });
+  const [authStatus, setAuthStatus] = useState({
+    logged_in: false,
+    connection_state: 'not_logged_in',
+    last_heartbeat_at: null,
+    last_error: null
+  });
+  const [marketStatus, setMarketStatus] = useState({
+    is_open: false,
+    session: 'closed',
+    timezone: 'America/New_York',
+    extended_hours_enabled: false
+  });
+  const [riskConfig, setRiskConfig] = useState(DEFAULT_RISK_CONFIG);
+  const [riskDraft, setRiskDraft] = useState(DEFAULT_RISK_CONFIG);
+  const [manualOrderDraft, setManualOrderDraft] = useState({
+    symbol: '',
+    side: 'buy',
+    quantity: 1,
+    limit_price: '',
+    mode: 'dry_run',
+    auto_cancel_seconds: 60
+  });
+  const [manualOrderStatus, setManualOrderStatus] = useState({ state: 'idle' });
+  const riskDraftTouched = useRef(false);
+  const szdtAuthKeyTouched = useRef(false);
+  const [tradingLogs, setTradingLogs] = useState([]);
+  const [loginPassword, setLoginPassword] = useState('');
+  const [systemMessage, setSystemMessage] = useState('');
+  const [systemBusy, setSystemBusy] = useState(false);
   const [isModalOpen, setIsModalOpen] = useState(false);
   const [editingSymbol, setEditingSymbol] = useState(null);
   const [viewMode, setViewMode] = useState('grid'); // 'grid' or 'table'
-  const [activeTab, setActiveTab] = useState('strategies'); // 'strategies' or 'holdings'
+  const [activeTab, setActiveTab] = useState(() => window.location.hash === '#options' ? 'options' : 'strategies');
   const [formData, setFormData] = useState({
     symbol: '',
     name: '',
@@ -34,6 +136,33 @@ function App() {
     emo_area: 'us'
   });
 
+  const fetchHistory = React.useCallback(async () => {
+    try {
+      const histRes = await axios.get(`${API_BASE}/all_history`);
+      setHistory(histRes.data);
+    } catch (err) {
+      console.error('Failed to fetch trade history', err);
+    }
+  }, []);
+
+  const fetchRealtimeOrders = React.useCallback(async () => {
+    try {
+      const ordersRes = await axios.get(`${API_BASE}/orders/realtime?limit=100`);
+      setRealtimeOrders(ordersRes.data || { orders: [], active_count: 0, updated_at: null });
+    } catch (err) {
+      console.error('Failed to fetch realtime orders', err);
+    }
+  }, []);
+
+  const fetchManualOrderStatus = React.useCallback(async () => {
+    try {
+      const statusRes = await axios.get(`${API_BASE}/orders/manual/status`);
+      setManualOrderStatus(statusRes.data || { state: 'idle' });
+    } catch (err) {
+      console.error('Failed to fetch manual order status', err);
+    }
+  }, []);
+
   const fetchRealtime = React.useCallback(async () => {
     try {
       const realRes = await axios.get(`${API_BASE}/realtime`);
@@ -41,11 +170,33 @@ function App() {
       const indRes = await axios.get(`${API_BASE}/indicator`);
       setIndicator(indRes.data);
       const holdRes = await axios.get(`${API_BASE}/holdings`);
-      setHoldings(holdRes.data);
+      setHoldings(Array.isArray(holdRes.data) ? holdRes.data : []);
       const accRes = await axios.get(`${API_BASE}/account`);
-      setAccount(accRes.data);
+      setAccount(normalizeAccount(accRes.data));
     } catch (err) {
       console.error('Failed to fetch realtime data', err);
+    }
+  }, []);
+
+  const fetchSystem = React.useCallback(async () => {
+    try {
+      const [statusRes, configRes, authRes, logsRes, marketRes] = await Promise.all([
+        axios.get(`${API_BASE}/trading/status`),
+        axios.get(`${API_BASE}/trading/config`),
+        axios.get(`${API_BASE}/auth/status`),
+        axios.get(`${API_BASE}/trading/logs?limit=120`),
+        axios.get(`${API_BASE}/market/status`)
+      ]);
+      const config = configRes.data || DEFAULT_RISK_CONFIG;
+      setRuntimeStatus(statusRes.data);
+      setManualOrderStatus(statusRes.data?.manual_order || { state: 'idle' });
+      setRiskConfig(config);
+      if (!riskDraftTouched.current) setRiskDraft({ ...config, szdt_auth_key: '' });
+      setAuthStatus(authRes.data);
+      setTradingLogs(logsRes.data?.lines || []);
+      setMarketStatus(marketRes.data);
+    } catch (err) {
+      console.error('Failed to fetch trading system status', err);
     }
   }, []);
 
@@ -53,21 +204,151 @@ function App() {
     try {
       const stratRes = await axios.get(`${API_BASE}/strategies`);
       setStrategies(stratRes.data);
-      const histRes = await axios.get(`${API_BASE}/all_history`);
-      setHistory(histRes.data);
+      fetchHistory();
+      fetchRealtimeOrders();
+      fetchManualOrderStatus();
       fetchRealtime();
+      fetchSystem();
     } catch (err) {
       console.error('Failed to fetch data', err);
     }
-  }, [fetchRealtime]);
+  }, [fetchHistory, fetchManualOrderStatus, fetchRealtime, fetchRealtimeOrders, fetchSystem]);
 
   useEffect(() => {
     fetchData();
     const interval = setInterval(() => {
       fetchRealtime();
-    }, 5000);
+      fetchHistory();
+      fetchSystem();
+    }, 10000);
     return () => clearInterval(interval);
-  }, [fetchData, fetchRealtime]);
+  }, [fetchData, fetchHistory, fetchRealtime, fetchSystem]);
+
+  useEffect(() => {
+    // SDK 推送先更新本地订单文件，前端只需轻量读取即可看到最新状态。
+    const interval = setInterval(() => {
+      fetchRealtimeOrders();
+      fetchManualOrderStatus();
+    }, 2000);
+    return () => clearInterval(interval);
+  }, [fetchManualOrderStatus, fetchRealtimeOrders]);
+
+  const handleLogin = async (e) => {
+    e.preventDefault();
+    setSystemBusy(true);
+    setSystemMessage('');
+    try {
+      await axios.post(`${API_BASE}/auth/login`, { password: loginPassword });
+      setLoginPassword('');
+      setSystemMessage('Huasheng 登录成功');
+      await fetchSystem();
+      await fetchRealtime();
+    } catch (err) {
+      setSystemMessage(err.response?.data?.detail || 'Huasheng 登录失败');
+    } finally {
+      setSystemBusy(false);
+    }
+  };
+
+  const handleStartTrading = async (mode) => {
+    if (mode === 'live' && !window.confirm('即将启动真实交易，后端将提交真实订单。确认继续吗？')) return;
+    setSystemBusy(true);
+    setSystemMessage('');
+    try {
+      await axios.post(`${API_BASE}/trading/start`, { mode });
+      setSystemMessage(mode === 'live' ? '真实交易引擎已启动' : 'Dry Run 引擎已启动');
+      await fetchSystem();
+    } catch (err) {
+      setSystemMessage(err.response?.data?.detail || '启动交易引擎失败');
+    } finally {
+      setSystemBusy(false);
+    }
+  };
+
+  const handleStopTrading = async () => {
+    setSystemBusy(true);
+    try {
+      await axios.post(`${API_BASE}/trading/stop`);
+      setSystemMessage('交易引擎已停止');
+      await fetchSystem();
+    } catch (err) {
+      setSystemMessage(err.response?.data?.detail || '停止交易引擎失败');
+    } finally {
+      setSystemBusy(false);
+    }
+  };
+
+  const handleManualOrder = async (e) => {
+    e.preventDefault();
+    const symbol = String(manualOrderDraft.symbol || '').trim().toUpperCase();
+    const quantity = Number(manualOrderDraft.quantity);
+    const limitPrice = Number(manualOrderDraft.limit_price);
+    if (!symbol || !Number.isInteger(quantity) || quantity <= 0 || !Number.isFinite(limitPrice) || limitPrice <= 0) {
+      setSystemMessage('请填写有效的股票代码、数量和限价');
+      return;
+    }
+    if (manualOrderDraft.mode === 'live') {
+      const sideText = manualOrderDraft.side === 'buy' ? '买入' : '卖出';
+      const confirmed = window.confirm(
+        `即将真实${sideText} ${quantity} 股 ${symbol}，限价 $${limitPrice.toFixed(2)}。\n\n` +
+        '这会提交真实订单，确认继续吗？'
+      );
+      if (!confirmed) return;
+    }
+
+    setSystemBusy(true);
+    setSystemMessage('正在提交手动订单请求…');
+    try {
+      const res = await axios.post(`${API_BASE}/orders/manual`, {
+        symbol,
+        side: manualOrderDraft.side,
+        quantity,
+        limit_price: limitPrice,
+        mode: manualOrderDraft.mode,
+        auto_cancel_seconds: Number(manualOrderDraft.auto_cancel_seconds),
+        confirm_live: manualOrderDraft.mode === 'live'
+      });
+      setManualOrderStatus(res.data.manual_order || { state: 'running' });
+      setSystemMessage('手动订单已提交，状态会在实时订单区域更新');
+      await fetchRealtimeOrders();
+    } catch (err) {
+      setSystemMessage(err.response?.data?.detail || '手动订单提交失败');
+    } finally {
+      setSystemBusy(false);
+    }
+  };
+
+  const handleRiskDraftChange = (field, value) => {
+    riskDraftTouched.current = true;
+    if (field === 'szdt_auth_key') szdtAuthKeyTouched.current = true;
+    setRiskDraft(prev => ({ ...prev, [field]: value }));
+  };
+
+  const handleSaveRiskConfig = async () => {
+    setSystemBusy(true);
+    setSystemMessage('');
+    try {
+      const payload = {
+        max_total_leverage: Number(riskDraft.max_total_leverage),
+        min_maintenance_margin_ratio: Number(riskDraft.min_maintenance_margin_ratio)
+      };
+      if (szdtAuthKeyTouched.current) {
+        payload.szdt_auth_key = String(riskDraft.szdt_auth_key || '').trim();
+      }
+      const res = await axios.put(`${API_BASE}/trading/config`, payload);
+      const saved = res.data.config;
+      setRiskConfig(saved);
+      setRiskDraft({ ...saved, szdt_auth_key: '' });
+      riskDraftTouched.current = false;
+      szdtAuthKeyTouched.current = false;
+      setSystemMessage('风控配置已保存，交易引擎下一轮检查时生效');
+      await fetchSystem();
+    } catch (err) {
+      setSystemMessage(err.response?.data?.detail || '风控配置保存失败');
+    } finally {
+      setSystemBusy(false);
+    }
+  };
 
   const [loadingName, setLoadingName] = useState(false);
 
@@ -171,6 +452,54 @@ function App() {
     }
   };
 
+  const toggleHoldingSort = (key) => {
+    setHoldingSort((current) => ({
+      key,
+      direction: current.key === key && current.direction === 'asc' ? 'desc' : 'asc'
+    }));
+  };
+
+  const sortedHoldings = React.useMemo(() => {
+    return [...holdings].sort((a, b) => {
+      const aValue = getHoldingSortValue(a, holdingSort.key, realtimeData);
+      const bValue = getHoldingSortValue(b, holdingSort.key, realtimeData);
+
+      // Keep unavailable numeric values (for example, missing Fear & Greed)
+      // at the bottom in both directions.
+      if (aValue === null && bValue === null) return 0;
+      if (aValue === null) return 1;
+      if (bValue === null) return -1;
+
+      const comparison = typeof aValue === 'string' && typeof bValue === 'string'
+        ? aValue.localeCompare(bValue, undefined, { numeric: true, sensitivity: 'base' })
+        : aValue - bValue;
+      return holdingSort.direction === 'asc' ? comparison : -comparison;
+    });
+  }, [holdings, holdingSort, realtimeData]);
+
+  const renderHoldingSortHeader = (key, label) => {
+    const active = holdingSort.key === key;
+    const sortIcon = active
+      ? (holdingSort.direction === 'asc' ? <ArrowUp size={14} /> : <ArrowDown size={14} />)
+      : <ArrowUpDown size={14} />;
+    return (
+      <th key={key} aria-sort={active ? `${holdingSort.direction}ending` : 'none'}>
+        <button
+          type="button"
+          className={`table-sort-button${active ? ' active' : ''}`}
+          onClick={() => toggleHoldingSort(key)}
+        >
+          <span>{label}</span>
+          {sortIcon}
+        </button>
+      </th>
+    );
+  };
+
+  if (activeTab === 'options') {
+    return <OptionsAnalyzer onBack={() => { window.location.hash = ''; setActiveTab('strategies'); }} />;
+  }
+
   return (
     <div className="app-container">
       <header>
@@ -194,14 +523,256 @@ function App() {
               fontWeight: 700, 
               color: indicator.value > 0 ? 'var(--danger)' : 'var(--success)' 
             }}>
-              {indicator.value.toFixed(1)}
+              {indicator.available ? Number(indicator.value).toFixed(1) : 'N/A'}
             </span>
           </div>
+          <button className="btn-secondary" onClick={() => { window.location.hash = 'options'; setActiveTab('options'); }}>
+            <TrendingUp size={20} /> 期权分析
+          </button>
           <button className="btn-primary" onClick={() => handleOpenModal()}>
             <Plus size={20} /> Add Stock
           </button>
         </div>
       </header>
+
+      <section className="system-control-panel animate-fade-in">
+        <div className="system-panel-header">
+          <div>
+            <h2 style={{ margin: 0 }}>交易系统控制中心</h2>
+            <p style={{ color: 'var(--text-muted)', marginTop: '0.35rem' }}>
+              后端统一管理登录、交易引擎、风控配置和运行日志
+            </p>
+          </div>
+          <div className={`runtime-status ${runtimeStatus.state === 'running' ? 'is-running' : 'is-stopped'}`}>
+            <span className="status-dot" />
+            {runtimeStatus.state === 'running'
+              ? `${runtimeStatus.mode === 'live' ? 'LIVE' : 'DRY RUN'} 运行中`
+              : '交易引擎已停止'}
+          </div>
+          <div className={`market-status ${marketStatus.is_open ? 'is-open' : 'is-closed'}`}>
+            <span className="status-dot" />
+            美股常规盘：{marketStatus.is_open ? '盘中' : '休市'}
+            <small>
+              {formatMarketTime(marketStatus.local_time)} ET
+            </small>
+          </div>
+        </div>
+
+        <div className="system-control-grid">
+          <div className="system-control-card">
+            <div className="card-label"><LogIn size={16} /> Huasheng 网关</div>
+            {authStatus.logged_in ? (
+              <div className="connection-ok">
+                <ShieldCheck size={18} /> 已登录，可启动交易引擎
+                {authStatus.login_at && <small>{new Date(authStatus.login_at).toLocaleString()}</small>}
+                {authStatus.last_heartbeat_at && (
+                  <small>最近探活：{new Date(authStatus.last_heartbeat_at).toLocaleString()}</small>
+                )}
+              </div>
+            ) : (
+              <>
+                {authStatus.last_error && (
+                  <div className="connection-error">网关不可用：{authStatus.last_error}</div>
+                )}
+                <form onSubmit={handleLogin} className="login-form">
+                  <input
+                    type="password"
+                    value={loginPassword}
+                    onChange={(e) => setLoginPassword(e.target.value)}
+                    placeholder="Huasheng 交易密码"
+                    required
+                  />
+                  <button className="btn-primary" type="submit" disabled={systemBusy}>
+                    <LogIn size={16} /> 登录
+                  </button>
+                </form>
+              </>
+            )}
+          </div>
+
+          <div className="system-control-card">
+            <div className="card-label"><Activity size={16} /> 引擎操作</div>
+            <div className="engine-meta">
+              <span>PID: {runtimeStatus.pid || '-'}</span>
+              <span>模式: {runtimeStatus.mode || '-'}</span>
+            </div>
+            <div className="engine-actions">
+              <button
+                className="btn-secondary"
+                onClick={() => handleStartTrading('dry_run')}
+                disabled={!authStatus.logged_in || runtimeStatus.state === 'running' || systemBusy}
+              >
+                <Play size={16} /> 启动 Dry Run
+              </button>
+              <button
+                className="btn-danger"
+                onClick={() => handleStartTrading('live')}
+                disabled={!authStatus.logged_in || runtimeStatus.state === 'running' || systemBusy}
+              >
+                <Play size={16} /> 启动 Live
+              </button>
+              <button
+                className="btn-secondary"
+                onClick={handleStopTrading}
+                disabled={runtimeStatus.state !== 'running' || systemBusy}
+              >
+                <Square size={16} /> 停止
+              </button>
+            </div>
+          </div>
+
+          <div className="system-control-card">
+            <div className="card-label"><ShieldCheck size={16} /> 全局风控配置</div>
+            <div className="risk-form-grid">
+              <label>
+                总杠杆上限（倍）
+                <input
+                  type="number"
+                  min="0.1"
+                  step="any"
+                  inputMode="decimal"
+                  value={riskDraft.max_total_leverage}
+                  onChange={(e) => handleRiskDraftChange('max_total_leverage', e.target.value)}
+                />
+              </label>
+              <label>
+                最低保证金比例（%）
+                <input
+                  type="number"
+                  min="1"
+                  max="100"
+                  step="1"
+                  value={(Number(riskDraft.min_maintenance_margin_ratio) * 100).toFixed(1)}
+                  onChange={(e) => handleRiskDraftChange('min_maintenance_margin_ratio', Number(e.target.value) / 100)}
+                />
+              </label>
+              <label className="risk-key-field">
+                SZDT Auth Key（可选）
+                <input
+                  type="password"
+                  value={riskDraft.szdt_auth_key || ''}
+                  placeholder={riskConfig.szdt_auth_key_configured ? '已配置，输入新值可覆盖' : '未配置'}
+                  autoComplete="new-password"
+                  onChange={(e) => handleRiskDraftChange('szdt_auth_key', e.target.value)}
+                />
+              </label>
+            </div>
+            <div className="risk-effective">
+              当前生效：{Number(riskConfig.max_total_leverage).toFixed(1)}x / {(Number(riskConfig.min_maintenance_margin_ratio) * 100).toFixed(1)}%
+              <span className="auth-key-status">
+                贪恐指数：{riskConfig.szdt_auth_key_configured ? `已配置（${riskConfig.szdt_auth_key_source}）` : '未配置'}
+              </span>
+              <button className="btn-secondary compact-button" onClick={handleSaveRiskConfig} disabled={systemBusy}>
+                <Save size={15} /> 保存
+              </button>
+            </div>
+          </div>
+
+          <div className="system-control-card">
+            <div className="card-label"><Activity size={16} /> 手动下单（限价）</div>
+            <p style={{ color: 'var(--text-muted)', fontSize: '0.78rem', margin: '0 0 0.75rem' }}>
+              只执行一笔，不启动自动策略循环；真实下单前会二次确认。
+            </p>
+            <form onSubmit={handleManualOrder}>
+              <div style={{ display: 'grid', gridTemplateColumns: '1.2fr 0.8fr', gap: '0.6rem' }}>
+                <label>
+                  股票代码
+                  <input
+                    value={manualOrderDraft.symbol}
+                    onChange={(e) => setManualOrderDraft(prev => ({ ...prev, symbol: e.target.value.toUpperCase() }))}
+                    placeholder="例如 TQQQ"
+                    required
+                  />
+                </label>
+                <label>
+                  方向
+                  <select
+                    value={manualOrderDraft.side}
+                    onChange={(e) => setManualOrderDraft(prev => ({ ...prev, side: e.target.value }))}
+                    style={{ background: 'var(--card-bg)', color: 'white', padding: '0.55rem', borderRadius: '0.5rem', border: '1px solid var(--glass-border)', width: '100%' }}
+                  >
+                    <option value="buy">买入</option>
+                    <option value="sell">卖出</option>
+                  </select>
+                </label>
+                <label>
+                  数量
+                  <input
+                    type="number"
+                    min="1"
+                    step="1"
+                    value={manualOrderDraft.quantity}
+                    onChange={(e) => setManualOrderDraft(prev => ({ ...prev, quantity: e.target.value }))}
+                    required
+                  />
+                </label>
+                <label>
+                  限价（美元）
+                  <input
+                  type="number"
+                  min="0.0001"
+                  step="any"
+                  inputMode="decimal"
+                  value={manualOrderDraft.limit_price}
+                    onChange={(e) => setManualOrderDraft(prev => ({ ...prev, limit_price: e.target.value }))}
+                    placeholder="必须大于 0"
+                    required
+                  />
+                </label>
+              </div>
+              <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '0.6rem', marginTop: '0.6rem' }}>
+                <label>
+                  模式
+                  <select
+                    value={manualOrderDraft.mode}
+                    onChange={(e) => setManualOrderDraft(prev => ({ ...prev, mode: e.target.value }))}
+                    style={{ background: 'var(--card-bg)', color: 'white', padding: '0.55rem', borderRadius: '0.5rem', border: '1px solid var(--glass-border)', width: '100%' }}
+                  >
+                    <option value="dry_run">Dry Run（不下单）</option>
+                    <option value="live">Live（真实下单）</option>
+                  </select>
+                </label>
+                <label>
+                  未成交自动撤单（秒）
+                  <input
+                    type="number"
+                    min="10"
+                    max="300"
+                    step="1"
+                    value={manualOrderDraft.auto_cancel_seconds}
+                    onChange={(e) => setManualOrderDraft(prev => ({ ...prev, auto_cancel_seconds: e.target.value }))}
+                    required
+                  />
+                </label>
+              </div>
+              <div className="risk-effective" style={{ marginTop: '0.75rem', justifyContent: 'space-between' }}>
+                <span style={{ color: manualOrderStatus.state === 'running' ? 'var(--primary)' : 'var(--text-muted)' }}>
+                  手动订单：{manualOrderStatus.state === 'running' ? '处理中' : manualOrderStatus.state === 'stopped' ? `已结束（${manualOrderStatus.exit_code ?? 0}）` : '空闲'}
+                </span>
+                <button
+                  type="submit"
+                  className={manualOrderDraft.mode === 'live' ? 'btn-danger' : 'btn-secondary'}
+                  disabled={systemBusy || manualOrderStatus.state === 'running' || (manualOrderDraft.mode === 'live' && !authStatus.logged_in)}
+                >
+                  {manualOrderDraft.mode === 'live' ? '提交真实订单' : '模拟提交'}
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
+
+        {systemMessage && <div className="system-message">{systemMessage}</div>}
+
+        <div className="log-panel">
+          <div className="log-panel-header">
+            <span>交易引擎日志</span>
+            <button className="btn-icon-small" onClick={fetchSystem} title="刷新状态和日志">
+              <RefreshCw size={16} />
+            </button>
+          </div>
+          <pre className="log-viewer">{tradingLogs.length ? tradingLogs.slice(-80).join('') : '暂无交易日志'}</pre>
+        </div>
+      </section>
 
       <section className="account-summary" style={{ 
         display: 'grid', 
@@ -232,6 +803,20 @@ function App() {
         <div className="stat-card" style={{ background: 'var(--card-bg)', padding: '1.25rem', borderRadius: '1rem', border: '1px solid var(--glass-border)' }}>
           <div style={{ color: 'var(--text-muted)', fontSize: '0.75rem', marginBottom: '0.25rem' }}>Buying Power</div>
           <div style={{ fontSize: '1.5rem', fontWeight: 700, color: 'var(--primary)' }}>${account.buying_power.toLocaleString(undefined, {minimumFractionDigits: 2})}</div>
+        </div>
+        <div className="stat-card" style={{ background: 'var(--card-bg)', padding: '1.25rem', borderRadius: '1rem', border: '1px solid var(--glass-border)' }}>
+          <div style={{ color: 'var(--text-muted)', fontSize: '0.75rem', marginBottom: '0.25rem' }}>Gross Leverage</div>
+          <div style={{ fontSize: '1.5rem', fontWeight: 700, color: account.gross_leverage > account.max_total_leverage ? 'var(--danger)' : 'var(--primary)' }}>
+            {Number(account.gross_leverage || 0).toFixed(2)}x
+          </div>
+          <small style={{ color: 'var(--text-muted)' }}>limit {Number(account.max_total_leverage || 0).toFixed(1)}x</small>
+        </div>
+        <div className="stat-card" style={{ background: 'var(--card-bg)', padding: '1.25rem', borderRadius: '1rem', border: '1px solid var(--glass-border)' }}>
+          <div style={{ color: 'var(--text-muted)', fontSize: '0.75rem', marginBottom: '0.25rem' }}>Margin Ratio</div>
+          <div style={{ fontSize: '1.5rem', fontWeight: 700, color: account.maintenance_margin_ratio !== null && account.maintenance_margin_ratio < account.min_maintenance_margin_ratio ? 'var(--danger)' : 'var(--success)' }}>
+            {account.maintenance_margin_ratio === null ? '-' : `${(Number(account.maintenance_margin_ratio) * 100).toFixed(1)}%`}
+          </div>
+          <small style={{ color: 'var(--text-muted)' }}>minimum {(Number(account.min_maintenance_margin_ratio || 0) * 100).toFixed(1)}%</small>
         </div>
       </section>
 
@@ -271,6 +856,21 @@ function App() {
           }}
         >
           Real-time Holdings
+        </button>
+        <button
+          onClick={() => setActiveTab('options')}
+          style={{
+            padding: '1rem 0.5rem',
+            background: 'none',
+            border: 'none',
+            color: activeTab === 'options' ? 'var(--primary)' : 'var(--text-muted)',
+            fontWeight: 600,
+            cursor: 'pointer',
+            borderBottom: activeTab === 'options' ? '2px solid var(--primary)' : 'none',
+            fontSize: '1rem'
+          }}
+        >
+          Options Analysis
         </button>
       </div>
 
@@ -352,7 +952,7 @@ function App() {
                         <div style={{ fontSize: '1.25rem', fontWeight: 700 }}>${real.lastPrice.toFixed(2)}</div>
                       </div>
                       <div>
-                        <div style={{ fontSize: '0.75rem', color: 'var(--text-muted)' }}>Holding</div>
+                        <div style={{ fontSize: '0.75rem', color: 'var(--text-muted)' }}>Holding / Equity %</div>
                         <div style={{ fontSize: '1.25rem', fontWeight: 700 }}>
                           {real.quantity}
                           <span style={{ fontSize: '0.8rem', color: 'var(--primary)', marginLeft: '0.5rem' }}>
@@ -372,7 +972,7 @@ function App() {
                           fontWeight: 700,
                           color: real.signal > 0 ? 'var(--danger)' : 'var(--success)'
                         }}>
-                          {real.signal ? real.signal.toFixed(1) : '0.0'}
+                          {real.signal_available ? Number(real.signal).toFixed(1) : 'N/A'}
                         </div>
                       </div>
                     </div>
@@ -415,7 +1015,7 @@ function App() {
                     <tr>
                       <th>Symbol</th>
                       <th>Name</th>
-                      <th>Price / Weight</th>
+                      <th>Price / Equity %</th>
                       <th>B/S Pt</th>
                       <th>B/S Tot</th>
                       <th>Intervals (B/S)</th>
@@ -427,7 +1027,7 @@ function App() {
                   </thead>
                   <tbody>
                     {Object.entries(strategies).map(([symbol, strat]) => {
-                      const real = realtimeData[symbol] || { lastPrice: 0, weight: 0, signal: 0 };
+                      const real = realtimeData[symbol] || { lastPrice: 0, weight: 0, signal: 0, signal_available: false };
                       return (
                         <tr key={symbol}>
                           <td style={{ fontWeight: 700, color: 'var(--primary)' }}>{symbol}</td>
@@ -443,9 +1043,9 @@ function App() {
                           <td>{strat.fear_greed_buy} / {strat.fear_greed_sell}</td>
                           <td style={{ 
                             fontWeight: 700,
-                            color: real.signal > 0 ? 'var(--danger)' : 'var(--success)'
+                            color: real.signal_available && real.signal > 0 ? 'var(--danger)' : 'var(--success)'
                           }}>
-                            {real.signal ? real.signal.toFixed(1) : '0.0'}
+                            {real.signal_available ? Number(real.signal).toFixed(1) : 'N/A'}
                           </td>
                           <td>
                             <div style={{ display: 'flex', gap: '0.5rem' }}>
@@ -466,27 +1066,30 @@ function App() {
             </section>
           )}
         </>
-      ) : (
+      ) : activeTab === 'holdings' ? (
         <section className="holdings-section animate-fade-in">
           <div style={{ overflowX: 'auto' }}>
             <table className="strategy-table">
               <thead>
                 <tr>
-                  <th>Symbol</th>
-                  <th>Name</th>
-                  <th>Quantity</th>
-                  <th>Cost Price</th>
-                  <th>Current Price</th>
-                  <th>Market Value</th>
-                  <th>Portfolio %</th>
-                  <th>Floating P&L</th>
+                  {renderHoldingSortHeader('symbol', 'Symbol')}
+                  {renderHoldingSortHeader('name', 'Name')}
+                  {renderHoldingSortHeader('quantity', 'Quantity')}
+                  {renderHoldingSortHeader('costPrice', 'Cost Price')}
+                  {renderHoldingSortHeader('currentPrice', 'Current Price')}
+                  {renderHoldingSortHeader('marketValue', 'Market Value')}
+                  {renderHoldingSortHeader('weight', 'Equity %')}
+                  {renderHoldingSortHeader('pnl', 'Floating P&L')}
+                  {renderHoldingSortHeader('signal', 'Fear & Greed')}
                   <th>Actions</th>
                 </tr>
               </thead>
               <tbody>
-                {holdings.length > 0 ? holdings.map((hold, i) => {
+                {sortedHoldings.length > 0 ? sortedHoldings.map((hold, i) => {
                   const income = parseFloat(hold.incomeBalance || 0);
                   const weight = hold.weight || 0;
+                  const realtime = getRealtimeForHolding(hold.stockCode, realtimeData);
+                  const signalAvailable = realtime.signal_available && realtime.signal !== null;
                   return (
                     <tr key={i}>
                       <td style={{ fontWeight: 700, color: 'var(--primary)' }}>{hold.stockCode}</td>
@@ -507,6 +1110,14 @@ function App() {
                           ({hold.incomeRatio})
                         </span>
                       </td>
+                      <td style={{
+                        fontWeight: 700,
+                        color: signalAvailable
+                          ? (realtime.signal > 0 ? 'var(--danger)' : 'var(--success)')
+                          : 'var(--text-muted)'
+                      }}>
+                        {signalAvailable ? Number(realtime.signal).toFixed(1) : 'N/A'}
+                      </td>
                       <td>
                         <button 
                           onClick={() => handleImportHolding(hold)}
@@ -521,7 +1132,7 @@ function App() {
                   );
                 }) : (
                   <tr>
-                    <td colSpan="7" style={{ textAlign: 'center', padding: '3rem', color: 'var(--text-muted)' }}>
+                    <td colSpan="10" style={{ textAlign: 'center', padding: '3rem', color: 'var(--text-muted)' }}>
                       No holdings found in the account.
                     </td>
                   </tr>
@@ -530,7 +1141,92 @@ function App() {
             </table>
           </div>
         </section>
+      ) : (
+        <OptionsAnalyzer />
       )}
+
+      {/* Real-time Orders Section */}
+      <section className="history-section animate-fade-in" style={{ marginTop: '3rem', padding: '1rem' }}>
+        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: '1rem', marginBottom: '1.5rem' }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: '0.75rem' }}>
+            <Activity size={24} className="text-primary" />
+            <div>
+              <h2 style={{ margin: 0 }}>实时订单</h2>
+              <small style={{ color: 'var(--text-muted)' }}>
+                SDK 推送优先，当前活动订单：{realtimeOrders.active_count || 0}
+                {realtimeOrders.updated_at && ` · 更新于 ${new Date(realtimeOrders.updated_at).toLocaleTimeString()}`}
+              </small>
+            </div>
+          </div>
+          <button className="btn-icon-small" onClick={fetchRealtimeOrders} title="刷新实时订单">
+            <RefreshCw size={16} />
+          </button>
+        </div>
+        <div style={{ overflowX: 'auto' }}>
+          <table className="strategy-table">
+            <thead>
+              <tr>
+                <th>更新时间</th>
+                <th>Symbol</th>
+                <th>方向</th>
+                <th>订单号</th>
+                <th>委托数量</th>
+                <th>已成交</th>
+                <th>剩余</th>
+                <th>成交/委托价</th>
+                <th>状态</th>
+              </tr>
+            </thead>
+            <tbody>
+              {(realtimeOrders.orders || []).length > 0 ? realtimeOrders.orders.map((item, i) => {
+                const status = item.status || 'Unknown';
+                const isFilled = status === 'Filled';
+                const isActive = Boolean(item.is_active);
+                return (
+                  <tr key={`${item.order_id || item.record_no || 'order'}-${i}`}>
+                    <td style={{ color: 'var(--text-muted)', fontSize: '0.8125rem' }}>
+                      {item.last_updated ? new Date(item.last_updated).toLocaleString() : '-'}
+                    </td>
+                    <td style={{ fontWeight: 700 }}>{item.symbol || '-'}</td>
+                    <td>
+                      <span style={{ color: item.action === 'buy' ? 'var(--success)' : 'var(--danger)', fontWeight: 700 }}>
+                        {(item.action || '-').toUpperCase()}
+                      </span>
+                    </td>
+                    <td style={{ fontFamily: 'monospace', fontSize: '0.8rem' }}>{item.order_id || item.record_no || '-'}</td>
+                    <td>{item.entrust_quantity || item.quantity || '-'}</td>
+                    <td>{item.filled_quantity || '-'}</td>
+                    <td>{item.remaining_quantity || (isFilled ? '0' : '-')}</td>
+                    <td>${item.business_price || item.entrust_price || item.price || '-'}</td>
+                    <td>
+                      <span style={{
+                        fontSize: '0.75rem',
+                        padding: '0.2rem 0.5rem',
+                        borderRadius: '0.25rem',
+                        background: isFilled
+                          ? 'rgba(34, 197, 94, 0.15)'
+                          : isActive
+                            ? 'rgba(59, 130, 246, 0.15)'
+                            : 'rgba(255, 255, 255, 0.05)',
+                        color: isFilled ? 'var(--success)' : isActive ? 'var(--primary)' : 'var(--text-muted)',
+                        border: `1px solid ${isFilled ? 'var(--success)' : isActive ? 'var(--primary)' : 'var(--glass-border)'}`
+                      }}>
+                        {status}
+                      </span>
+                    </td>
+                  </tr>
+                );
+              }) : (
+                <tr>
+                  <td colSpan="9" style={{ textAlign: 'center', padding: '2rem', color: 'var(--text-muted)' }}>
+                    暂无订单。下单后这里会实时显示委托和成交状态。
+                  </td>
+                </tr>
+              )}
+            </tbody>
+          </table>
+        </div>
+      </section>
 
       {/* Recent Trade History Section */}
       <section className="history-section animate-fade-in" style={{ marginTop: '3rem', padding: '1rem' }}>
@@ -659,9 +1355,10 @@ function App() {
                   />
                 </div>
                 <div className="form-group">
-                  <label>Sell Total ($) (0=all)</label>
+                  <label>Sell Total ($) (must be greater than 0)</label>
                   <input
                     type="number"
+                    min="1"
                     value={formData.sell_total}
                     onChange={(e) => setFormData({ ...formData, sell_total: parseInt(e.target.value) })}
                     required
